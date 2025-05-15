@@ -100,7 +100,7 @@ class ResBlock(nn.Module):
 
         torch.nn.init.normal_(self.conv2.weight, mean=0.0, std=1e-5)
 
-        # Upscale to an mask of image
+        # Upscale to mask of image
         self.time_fc1 = nn.Linear(time_dim, 2*filters)
         self.time_fc2 = nn.Linear(time_dim, 2*filters)
 
@@ -213,6 +213,79 @@ class EBM(nn.Module):
             output = self.fc4(h)
 
         return output
+
+class PatchEBM(nn.Module):
+    def __init__(self, inp_dim, out_dim, patchsize, is_ebm: bool = True):
+        super(PatchEBM, self).__init__()
+        self.inp_dim = inp_dim
+        self.out_dim = out_dim
+        self.patchsize = patchsize
+        self.is_ebm = is_ebm
+
+        h = 512
+        fourier_dim, time_dim = 128, 128
+        sinu_pos_emb = SinusoidalPosEmb(fourier_dim) # this is the sinusoidal embedding layer
+        self.time_mlp = nn.Sequential(
+            sinu_pos_emb,
+            nn.Linear(fourier_dim, time_dim),
+            nn.GELU(),
+            nn.Linear(time_dim, time_dim)
+        )
+
+        self.patch_encoder = nn.Sequential(
+            # this replaces self.fc1 in the original EBM
+            # the patchsize comes from the noisy inverse A^{-1}_t, inp_dim is the full original matrix context
+            nn.Linear(patchsize + inp_dim, h),
+            nn.GELU()
+        )
+
+        self.fc2 = nn.Linear(h, h)
+        self.fc3 = nn.Linear(h, h)
+        self.fc4 = nn.Linear(h, 1 if self.is_ebm else out_dim) # want to get one scalar energy output per patch
+        self.t_map_fc2 = nn.Linear(time_dim, 2 * h)
+        self.t_map_fc3 = nn.Linear(time_dim, 2 * h)
+    
+    def patchify(self, x):
+        # takes x and breaks into patches of size self.patchsize
+        batch_size, sample_dim = x.shape
+        self.num_patches = sample_dim // self.patchsize
+        x_patched = x.reshape(batch_size, self.num_patches, self.patchsize)
+        return x_patched
+
+    def forward(self, *args):
+        # depending on whether this is unconditional, conditional, or latent, x may be noised x_t, x_t with known entries enforced via mask, or latent version of x_t
+        if self.is_ebm:
+            x_cat, t_patchwise = args
+            x = x_cat[:, :self.inp_dim] # this is the global context that goes with everything
+            y = x_cat[:, self.inp_dim:] # this is the thing to patch
+        else:
+            x, y, t_patchwise = args
+        
+        y_patched = self.patchify(y) # gets [batch_size, num_patches, patchsize]
+        batch_size = y_patched.shape[0]
+        x_context_repeated = x.unsqueeze(1).expand(-1, self.num_patches, -1) # get this to batch_size, num_patches, inp_dim; each patch gets its own corresponding copy
+        patch_and_context = torch.cat([y_patched, x_context_repeated], dim = -1) # get [batch_size, num_patches, patchsize + inp_dim] to feed into patch encoder
+        
+        # need to flatten the inputs to feed through the layers
+        patch_and_context_flat = patch_and_context.view(batch_size * self.num_patches, -1)
+        t_patchwise_flat = t_patchwise.view(batch_size * self.num_patches)
+
+        # time embeddings
+        t_emb = self.time_mlp(t_patchwise_flat)
+        fc2_gain, fc2_bias = torch.chunk(self.t_map_fc2(t_emb), 2, dim = -1)
+        fc3_gain, fc3_bias = torch.chunk(self.t_map_fc3(t_emb), 2, dim = -1)
+
+        # go thru layers
+        h = swish(self.patch_encoder(patch_and_context_flat)) # gets [batch_size * num_patches, h]
+        h = swish(self.fc2(h) * (fc2_gain + 1) + fc2_bias)
+        h = swish(self.fc3(h) * (fc3_gain + 1) + fc3_bias)
+
+        if self.is_ebm:
+            out = self.fc4(h).pow(2).sum(dim = -1, keepdim = True) # [batch_size * num_patches, out_dim]
+        else:
+            out = self.fc4(h) # [batch_size * num_patches, out_dim]
+
+        return out.view(batch_size, self.num_patches, -1) # [batch_size, num_patches, 1] — i.e. one scalar value for each batch sample and patch
 
 
 class AutoencodeModel(nn.Module):

@@ -899,7 +899,7 @@ class Trainer1D(object):
 
                 total_loss = 0.
 
-                end_tiem = time.time()
+                end_time = time.time()
                 for _ in range(self.gradient_accumulate_every):
                     data = next(self.dl)
 
