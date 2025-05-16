@@ -40,7 +40,7 @@ parser = argparse.ArgumentParser(description='Train Diffusion Reasoning Model')
 
 parser.add_argument('--dataset', default='inverse', type=str, help='dataset to evaluate')
 parser.add_argument('--inspect-dataset', action='store_true', help='run an IPython embed interface after loading the dataset')
-parser.add_argument('--model', default='mlp', type=str, choices=['mlp', 'mlp-reverse', 'sudoku', 'sudoku-latent', 'sudoku-transformer', 'sudoku-reverse', 'gnn', 'gnn-reverse', 'gnn-conv', 'gnn-conv-1d', 'gnn-conv-1d-v2', 'gnn-conv-1d-v2-reverse'])
+parser.add_argument('--model', default='mlp', type=str, choices=['mlp', 'mlp-reverse', 'sudoku', 'sudoku-latent', 'sudoku-transformer', 'sudoku-reverse', 'gnn', 'gnn-reverse', 'gnn-conv', 'gnn-conv-1d', 'gnn-conv-1d-v2', 'gnn-conv-1d-v2-reverse', 'mlp-patch'])
 parser.add_argument('--load-milestone', type=str, default=None, help='load a model from a milestone')
 parser.add_argument('--batch_size', default=200, type=int, help='size of batch of input to use')
 parser.add_argument('--diffusion_steps', default=15, type=int, help='number of diffusion time steps (default: 10)')
@@ -74,6 +74,7 @@ if __name__ == "__main__":
         dataset = Inverse("train", FLAGS.rank, FLAGS.ood)
         validation_dataset = dataset
         metric = 'mse'
+        print(f"got inverse")
     elif FLAGS.dataset == "lowrank":
         dataset = LowRankDataset("train", FLAGS.rank, FLAGS.ood)
         validation_dataset = dataset
