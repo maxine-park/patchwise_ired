@@ -462,7 +462,7 @@ class Inverse(data.Dataset):
     def __len__(self):
         """Return the total number of images in the dataset."""
         # Dataset is always randomly generated
-        return int(1e7)
+        return int(2000)
 
 
 class Equation(data.Dataset):
