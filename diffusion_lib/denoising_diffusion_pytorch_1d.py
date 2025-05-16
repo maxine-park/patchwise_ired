@@ -1416,6 +1416,7 @@ class PatchGaussianDiffusion1D(nn.Module):
             # print(f"num_patches is {num_patches} in p_sample_loop t iterator")
             self_cond = x_start if self.self_condition else None
 
+            cond_val = None
             if mask is not None:
                 cond_val = self.q_sample(x_start=inp, t_patchwise=t_patchwise, noise=torch.zeros_like(inp))
                 img = img * (1 - mask) + cond_val * mask
@@ -1938,7 +1939,7 @@ class PatchTrainer1D(object):
         for file in [self.val_accuracy_log, self.patch_accuracy_log]:
             if not os.path.exists(file):
                 with open(file, mode='w', newline='') as f:
-                    writer = csv.writer(f)
+                    writer = csv.writer(f)x
                     if "val_accuracy" in str(file):
                         writer.writerow(["step", "accuracy"])
                     elif "patch_accuracy" in str(file):
