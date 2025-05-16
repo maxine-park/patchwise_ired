@@ -26,7 +26,7 @@ from tqdm.auto import tqdm
 import os.path as osp
 import time
 import numpy as np
-
+from datetime import datetime
 
 def _custom_exception_hook(type, value, tb):
     if hasattr(sys, 'ps1') or not sys.stderr.isatty():
@@ -1832,7 +1832,7 @@ class PatchTrainer1D(object):
         evaluate_first = False,
         latent = False,
         autoencode_model = None,
-        patchwise_inference = True
+        patchwise_inference = True,
     ):
         super().__init__()
 
@@ -1931,9 +1931,10 @@ class PatchTrainer1D(object):
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
         self.evaluate_first = evaluate_first
         self.model.patchwise_inference = patchwise_inference
-
-        self.val_accuracy_log = self.results_folder / f"validation_accuracy_ps{self.patchsize}.csv"
-        self.patch_accuracy_log = self.results_folder / f"patch_accuracy_ps{self.patchsize}.csv"
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.val_accuracy_log = self.results_folder / f"validation_accuracy_{timestamp}.csv"
+        self.patch_accuracy_log = self.results_folder / f"patch_accuracy_{timestamp}.csv"
         for file in [self.val_accuracy_log, self.patch_accuracy_log]:
             if not os.path.exists(file):
                 with open(file, mode='w', newline='') as f:
