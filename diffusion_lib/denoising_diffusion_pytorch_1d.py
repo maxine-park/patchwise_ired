@@ -1939,7 +1939,7 @@ class PatchTrainer1D(object):
         for file in [self.val_accuracy_log, self.patch_accuracy_log]:
             if not os.path.exists(file):
                 with open(file, mode='w', newline='') as f:
-                    writer = csv.writer(f)x
+                    writer = csv.writer(f)
                     if "val_accuracy" in str(file):
                         writer.writerow(["step", "accuracy"])
                     elif "patch_accuracy" in str(file):
