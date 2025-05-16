@@ -1426,24 +1426,27 @@ class PatchGaussianDiffusion1D(nn.Module):
                 x_start_patched = torch.zeros_like(img_patched)
 
                 for patch_idx in range(num_patches):
-                    # print(f"num_patches is {num_patches} in p_sample_loop patch index")
                     patch_mask = torch.zeros((batch_size, num_patches), device=device)
-                    # print(f"num_patches is {num_patches} in p_sample_loop after pathc mask")
                     patch_mask[:, patch_idx] = 1
                     patch_mask = patch_mask.unsqueeze(-1).expand(-1, -1, self.patchsize).reshape(batch_size, -1)
 
-                    temp_img = img * patch_mask  # isolate only patch_idx
+                    temp_img = img * patch_mask
                     patch_x_start_input = temp_img.clone()
 
                     _, x_start_patch = self.p_sample(inp, patch_x_start_input, t_patchwise, self_cond, scale=False, with_noise=self.baseline)
-                    # x_start_patch = self.get_patched(x_start_patch)
                     x_start_patched[:, patch_idx] = x_start_patch[:, patch_idx]
 
-                    if self.use_innerloop_opt and t < 50:
+                    if self.use_innerloop_opt and t < 50 and mask is not None:
                         step = 20 if self.sudoku else 5
                         flat_img = x_start_patched.reshape(batch_size, -1)
-                        flat_img = self.opt_step(inp, flat_img, t_patchwise, mask, cond_val, step=step, sf=1.0, patch_idx=patch_idx)
+
+                        # Create patch-specific cond_val
+                        cond_val_patch = self.q_sample(x_start=inp, t_patchwise=t_patchwise, noise=torch.zeros_like(inp))
+                        cond_val_patch = cond_val_patch * patch_mask
+
+                        flat_img = self.opt_step(inp, flat_img, t_patchwise, mask * patch_mask, cond_val_patch, step=step, sf=1.0, patch_idx=patch_idx)
                         x_start_patched = self.get_patched(flat_img)
+
 
                 x_start = x_start_patched
                 img = x_start.view(batch_size, -1)
