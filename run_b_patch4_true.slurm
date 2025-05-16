@@ -9,7 +9,7 @@
 #SBATCH --time=12:00:00
 
 source ~/.bashrc
-mamba activate newenv
+mamba activate myenv
 
 mkdir -p logs cluster_logs
 
