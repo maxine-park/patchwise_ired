@@ -9,7 +9,7 @@
 #SBATCH --time=1:00:00
 
 source ~/.bashrc
-mamba activate iredenv
+mamba activate newenv
 
 mkdir -p logs cluster_logs
 
