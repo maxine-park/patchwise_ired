@@ -22,4 +22,5 @@ python train.py \
     --patchwise_inference True \
     --use-innerloop-opt True \
     --supervise-energy-landscape True \
+    --data-workers 4 \
     > logs/inverse_b_patch4_true.log 2>&1

@@ -21,4 +21,5 @@ python train.py \
     --use-innerloop-opt True \
     --supervise-energy-landscape True \
     --patchwise_inference False \
+    --data-workers 4 \
     > logs/inverse_a_mlp.log 2>&1
