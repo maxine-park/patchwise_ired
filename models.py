@@ -214,7 +214,7 @@ class EBM(nn.Module):
 
         return output
 
-class PatchEBM(nn.Module):
+class PatchEBM(nn.Module): # MAX_EDIT: added this
     def __init__(self, inp_dim, out_dim, patchsize, is_ebm: bool = True):
         super(PatchEBM, self).__init__()
         self.inp_dim = inp_dim
@@ -246,10 +246,14 @@ class PatchEBM(nn.Module):
         self.t_map_fc3 = nn.Linear(time_dim, 2 * h)
     
     def patchify(self, x):
+        if x.dim() == 3:
+            return x
+        print(f"Patchifying input of shape {x.shape} with patchsize {self.patchsize}")
         # takes x and breaks into patches of size self.patchsize
         batch_size, sample_dim = x.shape
-        self.num_patches = sample_dim // self.patchsize
-        x_patched = x.reshape(batch_size, self.num_patches, self.patchsize)
+        num_patches = x.shape[-1] // self.patchsize
+        x_patched = x.reshape(batch_size, num_patches, self.patchsize)
+        print(f"Patched shape: {x_patched.shape}")
         return x_patched
 
     def forward(self, *args):
@@ -262,13 +266,15 @@ class PatchEBM(nn.Module):
             x, y, t_patchwise = args
         
         y_patched = self.patchify(y) # gets [batch_size, num_patches, patchsize]
+        batch_size, sample_dim = y.shape
+        num_patches = sample_dim // self.patchsize
         batch_size = y_patched.shape[0]
-        x_context_repeated = x.unsqueeze(1).expand(-1, self.num_patches, -1) # get this to batch_size, num_patches, inp_dim; each patch gets its own corresponding copy
+        x_context_repeated = x.unsqueeze(1).expand(-1, num_patches, -1) # get this to batch_size, num_patches, inp_dim; each patch gets its own corresponding copy
         patch_and_context = torch.cat([y_patched, x_context_repeated], dim = -1) # get [batch_size, num_patches, patchsize + inp_dim] to feed into patch encoder
         
         # need to flatten the inputs to feed through the layers
-        patch_and_context_flat = patch_and_context.view(batch_size * self.num_patches, -1)
-        t_patchwise_flat = t_patchwise.view(batch_size * self.num_patches)
+        patch_and_context_flat = patch_and_context.view(batch_size * num_patches, -1)
+        t_patchwise_flat = t_patchwise.view(batch_size * num_patches)
 
         # time embeddings
         t_emb = self.time_mlp(t_patchwise_flat)
@@ -285,9 +291,30 @@ class PatchEBM(nn.Module):
         else:
             out = self.fc4(h) # [batch_size * num_patches, out_dim]
 
-        return out.view(batch_size, self.num_patches, -1) # [batch_size, num_patches, 1] — i.e. one scalar value for each batch sample and patch
+        return out.view(batch_size, num_patches, -1) # [batch_size, num_patches, 1] — i.e. one scalar value for each batch sample and patch
 
-
+class PatchDiffusionWrapper(nn.Module): # MAX_EDIT: added this
+    def __init__(self, patch_ebm):
+        super(PatchDiffusionWrapper, self).__init__()
+        self.ebm = patch_ebm
+        self.inp_dim = patch_ebm.inp_dim
+        self.out_dim = patch_ebm.out_dim
+        self.patchsize = patch_ebm.patchsize
+        if hasattr(self.ebm, 'is_ebm'):
+            assert self.ebm.is_ebm, 'PatchDiffusionWrapper only works for PatchEBMs'
+            assert self.ebm.patchsize is not None, 'PatchDiffusionWrapper only works for PatchEBMs'
+    def forward(self, inp, opt_out, t_patchwise, return_energy = False, return_both = False):
+        opt_out.requires_grad_(True)
+        opt_variable = torch.cat([inp, opt_out], dim=-1)
+        energy = self.ebm(opt_variable, t_patchwise) # gets [batch_size, num_patches, 1]
+        if return_energy:
+            return energy
+        opt_grad = torch.autograd.grad([energy.sum()], [opt_out], create_graph = True, retain_graph = True)[0]
+        if return_both:
+            return energy, opt_grad
+        else:
+            return opt_grad
+        
 class AutoencodeModel(nn.Module):
     def __init__(self, inp_dim, out_dim):
         super().__init__()
@@ -295,7 +322,7 @@ class AutoencodeModel(nn.Module):
         assert inp_dim == out_dim == 729
         h = 128
 
-        self.conv1 = nn.Conv2d(9, h, 3, padding=1)
+        self.conv1 = nn.Conxv2d(9, h, 3, padding=1)
         self.conv2 = nn.Conv2d(h, h, 3, padding=1)
         self.conv3 = nn.Conv2d(h, 3, 3, padding=1)
 
@@ -865,6 +892,7 @@ class DiffusionWrapper(nn.Module):
         self.ebm = ebm
         self.inp_dim = ebm.inp_dim
         self.out_dim = ebm.out_dim
+        # self.patchsize = ebm.patchsize
 
         if hasattr(self.ebm, 'is_ebm'):
             assert self.ebm.is_ebm, 'DiffusionWrapper only works for EBMs'
@@ -884,6 +912,9 @@ class DiffusionWrapper(nn.Module):
             return energy, opt_grad
         else:
             return opt_grad
+        
+
+
 
 
 class GNNDiffusionWrapper(nn.Module):

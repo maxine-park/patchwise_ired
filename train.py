@@ -6,8 +6,8 @@ os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['NUMEXPR_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 
-from diffusion_lib.denoising_diffusion_pytorch_1d import GaussianDiffusion1D, Trainer1D
-from models import EBM, DiffusionWrapper
+from diffusion_lib.denoising_diffusion_pytorch_1d import GaussianDiffusion1D, Trainer1D, PatchGaussianDiffusion1D, PatchTrainer1D
+from models import EBM, DiffusionWrapper, PatchEBM, PatchDiffusionWrapper
 from models import SudokuEBM, SudokuTransformerEBM, SudokuDenoise, SudokuLatentEBM, AutoencodeModel
 from models import GraphEBM, GraphReverse, GNNConvEBM, GNNDiffusionWrapper, GNNConvDiffusionWrapper, GNNConv1DEBMV2, GNNConv1DV2DiffusionWrapper, GNNConv1DReverse
 from dataset import Addition, LowRankDataset, Inverse
@@ -53,6 +53,8 @@ parser.add_argument('--evaluate', action='store_true', default=False)
 parser.add_argument('--latent', action='store_true', default=False)
 parser.add_argument('--ood', action='store_true', default=False)
 parser.add_argument('--baseline', action='store_true', default=False)
+parser.add_argument('--patchsize', default=None, type=int, help='size of the patch to split matrix into for training + inference')
+parser.add_argument('--patchwise_inference', default = True, type=bool, help = 'during inference do we denoise by patch or the entire matrix at each step')
 
 
 if __name__ == "__main__":
@@ -60,9 +62,9 @@ if __name__ == "__main__":
 
     validation_dataset = None
     extra_validation_datasets = dict()
-    extra_validation_every_mul = 10
-    save_and_sample_every = 1000
-    validation_batch_size = 256
+    extra_validation_every_mul = 1
+    save_and_sample_every = 500
+    validation_batch_size = 100
 
     if FLAGS.dataset == "addition":
         dataset = Addition("train", FLAGS.rank, FLAGS.ood)
@@ -192,6 +194,13 @@ if __name__ == "__main__":
             out_dim = dataset.out_dim,
         )
         model = DiffusionWrapper(model)
+    elif FLAGS.model == 'mlp-patch': ## MAX_EDIT: added this for patchwise model
+        model = PatchEBM(
+            inp_dim = dataset.inp_dim,
+            out_dim = dataset.out_dim,
+            patchsize = FLAGS.patchsize
+        )
+        model = PatchDiffusionWrapper(model)
     elif FLAGS.model == 'mlp-reverse':
         model = EBM(
             inp_dim = dataset.inp_dim,
@@ -262,9 +271,18 @@ if __name__ == "__main__":
     if FLAGS.dataset in ['shortest-path', 'shortest-path-1d']:
         kwargs['shortest_path'] = True
 
-    diffusion = GaussianDiffusion1D(
+    # MAX_EDIT: added diffusion_class here
+
+    if FLAGS.model == 'mlp-patch':
+        diffusion_class = PatchGaussianDiffusion1D
+        trainer_class = PatchTrainer1D
+    else:
+        diffusion_class = GaussianDiffusion1D
+        trainer_class = Trainer1D
+
+    diffusion = diffusion_class(
         model,
-        seq_length = 32,
+        seq_length = 32, # MAX_COMMENT: this was commented out everywhere in diffusion classes so dead arg
         objective = 'pred_noise',  # Alternative pred_x0
         timesteps = FLAGS.diffusion_steps,  # number of steps
         sampling_timesteps = FLAGS.diffusion_steps,  # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper]),
@@ -288,13 +306,13 @@ if __name__ == "__main__":
     else:
         autoencode_model = None
 
-    trainer = Trainer1D(
+    trainer = trainer_class( # MAX_EDIT: changed this to trainer_class
         diffusion,
         dataset,
         train_batch_size = FLAGS.batch_size,
         validation_batch_size = validation_batch_size,
         train_lr = 1e-4,
-        train_num_steps = 1300000,         # total training steps
+        train_num_steps = 2000, #1300000,         # total training steps
         gradient_accumulate_every = 1,    # gradient accumulation steps
         ema_decay = 0.995,                # exponential moving average decay
         data_workers = FLAGS.data_workers,
@@ -308,7 +326,8 @@ if __name__ == "__main__":
         save_and_sample_every = save_and_sample_every,
         evaluate_first = FLAGS.evaluate,  # run one evaluation first
         latent = FLAGS.latent,  # whether we are doing reasoning in the latent space
-        autoencode_model = autoencode_model
+        autoencode_model = autoencode_model,
+        patchwise_inference = FLAGS.patchwise_inference
     )
 
     if FLAGS.load_milestone is not None:

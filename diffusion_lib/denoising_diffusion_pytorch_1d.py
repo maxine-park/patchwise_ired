@@ -1,5 +1,7 @@
+import csv
 import math
 import sys
+import os
 import collections
 from multiprocessing import cpu_count
 from pathlib import Path
@@ -134,10 +136,13 @@ def unnormalize_to_zero_to_one(t):
 
 # gaussian diffusion trainer class
 
+# def extract(a, t, x_shape):
+#     b, *_ = t.shape
+#     out = a.gather(-1, t)
+#     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 def extract(a, t, x_shape):
-    b, *_ = t.shape
-    out = a.gather(-1, t)
-    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+    return a[t.view(-1)].view(*t.shape, *([1] * (len(x_shape) - len(t.shape))))
+
 
 def linear_beta_schedule(timesteps):
     scale = 1000 / timesteps
@@ -746,7 +751,8 @@ class Trainer1D(object):
         extra_validation_every_mul = 10,
         evaluate_first = False,
         latent = False,
-        autoencode_model = None
+        autoencode_model = None,
+        patchwise_inference = True
     ):
         super().__init__()
 
@@ -1098,6 +1104,1135 @@ class Trainer1D(object):
                     raise NotImplementedError()
 
             rows = [[k, v.avg] for k, v in meters.items()]
+            print(f'Validation Result @ Iteration {self.step}; Milestone = {milestone} (ID: {prefix})')
+            print(tabulate(rows))
+
+  
+class PatchGaussianDiffusion1D(nn.Module):
+    def __init__(
+        self,
+        model,
+        *,
+        seq_length,
+        timesteps = 1000,
+        sampling_timesteps = None,
+        objective = 'pred_noise',
+        beta_schedule = 'cosine',
+        ddim_sampling_eta = 0.,
+        auto_normalize = True,
+        supervise_energy_landscape = True,
+        use_innerloop_opt = True,
+        show_inference_tqdm = True,
+        baseline = False,
+        sudoku = False,
+        continuous = False,
+        connectivity = False,
+        shortest_path = False,
+        patchwise_inference = True,
+    ):
+        super().__init__()
+        self.model = model
+        self.inp_dim = self.model.inp_dim
+        self.out_dim = self.model.out_dim
+        self.patchsize = self.model.patchsize
+        self.out_shape = (self.out_dim, )
+        self.self_condition = False
+        self.supervise_energy_landscape = supervise_energy_landscape
+        self.use_innerloop_opt = use_innerloop_opt
+        self.patchwise_inference = patchwise_inference
+
+        self.seq_length = seq_length
+        self.objective = objective
+        self.show_inference_tqdm = show_inference_tqdm
+        assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
+
+        if beta_schedule == 'linear':
+            betas = linear_beta_schedule(timesteps)
+        elif beta_schedule == 'cosine':
+            betas = cosine_beta_schedule(timesteps)
+        else:
+            raise ValueError(f'unknown beta schedule {beta_schedule}')
+
+        alphas = 1. - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
+
+        timesteps, = betas.shape
+        self.num_timesteps = int(timesteps)
+        self.baseline = baseline
+        self.sudoku = sudoku
+        self.connectivity = connectivity
+        self.continuous = continuous
+        self.shortest_path = shortest_path
+
+        # sampling related parameters
+
+        self.sampling_timesteps = default(sampling_timesteps, timesteps) # default num sampling timesteps to number of timesteps at training
+
+        assert self.sampling_timesteps <= timesteps
+        self.is_ddim_sampling = self.sampling_timesteps < timesteps
+        self.ddim_sampling_eta = ddim_sampling_eta
+
+        # helper function to register buffer from float64 to float32
+
+        register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
+
+        register_buffer('betas', betas)
+        register_buffer('alphas_cumprod', alphas_cumprod)
+        register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+
+        register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
+
+        register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
+        register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
+        register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
+
+        # Step size for optimizing
+        register_buffer('opt_step_size', betas * torch.sqrt( 1 / (1 - alphas_cumprod)))
+        # register_buffer('opt_step_size', 0.25 * torch.sqrt(alphas_cumprod) * torch.sqrt(1 / alphas_cumprod -1))
+
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
+
+        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+
+        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
+
+        register_buffer('posterior_variance', posterior_variance)
+
+        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+
+        register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min =1e-20)))
+        register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
+        register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
+
+        # calculate loss weight
+
+        snr = alphas_cumprod / (1 - alphas_cumprod)
+
+        if objective == 'pred_noise':
+            loss_weight = torch.ones_like(snr)
+        elif objective == 'pred_x0':
+            loss_weight = snr
+        elif objective == 'pred_v':
+            loss_weight = snr / (snr + 1)
+
+        register_buffer('loss_weight', loss_weight)
+        # whether to autonormalize
+
+    # def predict_start_from_noise(self, x_t, t, noise):
+    #     return (
+    #         extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+    #         extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+    #     )
+
+    def get_patched(self, x):
+        if x.dim() != 2:
+            return x
+        batch_size = x.shape[0]
+        num_patches = x.shape[1]//self.patchsize
+        x_patched = x.view(batch_size, num_patches, self.patchsize)
+        return x_patched
+    
+    def predict_start_from_noise(self, x_t, t_patchwise, noise):
+        # assumptions: x_t, noise are shaped [b, num_p, ps]
+        t_flat = t_patchwise.reshape(-1) # flatten b * num_patches
+        x_shape = x_t.shape
+        x_t_flat = x_t.reshape(-1, x_shape[-1]) # b * num_patches, out_dim
+        sqrt_recip =  extract(self.sqrt_recip_alphas_cumprod, t_flat, (len(t_flat), 1))
+        sqrt_recipm1 = extract(self.sqrt_recipm1_alphas_cumprod, t_flat, (len(t_flat), 1))
+        result = sqrt_recip * x_t_flat - sqrt_recipm1 * noise.reshape(-1, x_shape[-1])
+        return result.reshape(*x_shape)  # [b, num_p, ps]
+
+    # def predict_noise_from_start(self, x_t, t, x0):
+    #     return (
+    #         (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / \
+    #         extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+    #     )
+    def predict_noise_from_start(self, x_t, t_patchwise, x0):
+        t_flat = t_patchwise.reshape(-1)
+        x_shape = x_t.shape
+        x_t_flat = x_t.reshape(-1, x_shape[-1])
+        x0_flat = x0.reshape(-1, x_shape[-1])
+        
+        sqrt_recip = extract(self.sqrt_recip_alphas_cumprod, t_flat, (len(t_flat), 1))
+        sqrt_recipm1 = extract(self.sqrt_recipm1_alphas_cumprod, t_flat, (len(t_flat), 1))
+        
+        result = (sqrt_recip * x_t_flat - x0_flat) / sqrt_recipm1
+        return result.reshape(*x_shape)
+
+    # def predict_v(self, x_start, t, noise):
+    #     return (
+    #         extract(self.sqrt_alphas_cumprod, t, x_start.shape) * noise -
+    #         extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
+    #     )
+    def predict_v(self, x_start, t_patchwise, noise):
+        t_flat = t_patchwise.reshape(-1)
+        x_shape = x_start.shape
+        x_start_flat = x_start.reshape(-1, x_shape[-1])
+        noise_flat = noise.reshape(-1, x_shape[-1])
+        
+        sqrt_alpha = extract(self.sqrt_alphas_cumprod, t_flat, (len(t_flat), 1))
+        sqrt_one_minus = extract(self.sqrt_one_minus_alphas_cumprod, t_flat, (len(t_flat), 1))
+        
+        result = sqrt_alpha * noise_flat - sqrt_one_minus * x_start_flat
+        return result.reshape(*x_shape)
+
+    # def predict_start_from_v(self, x_t, t, v):
+    #     return (
+    #         extract(self.sqrt_alphas_cumprod, t, x_t.shape) * x_t -
+    #         extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
+    #     )
+    def predict_start_from_v(self, x_t, t_patchwise, v):
+        t_flat = t_patchwise.reshape(-1)
+        x_shape = x_t.shape
+        x_t_flat = x_t.reshape(-1, x_shape[-1])
+        v_flat = v.reshape(-1, x_shape[-1])
+        
+        sqrt_alpha = extract(self.sqrt_alphas_cumprod, t_flat, (len(t_flat), 1))
+        sqrt_one_minus = extract(self.sqrt_one_minus_alphas_cumprod, t_flat, (len(t_flat), 1))
+        
+        result = sqrt_alpha * x_t_flat - sqrt_one_minus * v_flat
+        return result.reshape(*x_shape)
+
+    # def q_posterior(self, x_start, x_t, t):
+    #     posterior_mean = (
+    #         extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
+    #         extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+    #     )
+    #     posterior_variance = extract(self.posterior_variance, t, x_t.shape)
+    #     posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
+    #     return posterior_mean, posterior_variance, posterior_log_variance_clipped
+    
+    def q_posterior(self, x_start, x_t, t_patchwise):
+        # assumes x_start, x_t: [batchsize, num_patches, patchsize]
+        # assumes t_patchwise: [batchsize, num_patches]
+        t_flat = t_patchwise.reshape(-1)
+        x_shape = x_t.shape
+        x_t_flat = x_t.reshape(-1, x_shape[-1])
+        x_start_flat = x_start.reshape(-1, x_shape[-1])
+        
+        coef1 = extract(self.posterior_mean_coef1, t_flat, (len(t_flat), 1))
+        coef2 = extract(self.posterior_mean_coef2, t_flat, (len(t_flat), 1))
+        variance = extract(self.posterior_variance, t_flat, (len(t_flat), 1))
+        log_variance = extract(self.posterior_log_variance_clipped, t_flat, (len(t_flat), 1))
+        
+        mean = coef1 * x_start_flat + coef2 * x_t_flat
+        return mean.reshape(*x_shape), variance.reshape(*x_shape[:-1], 1), log_variance.reshape(*x_shape[:-1], 1)
+
+    def model_predictions(self, inp, x, t_patchwise, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
+        with torch.enable_grad():
+            model_output = self.model(inp, x, t_patchwise) # shaped [b, num_p * patchsize]
+
+        maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
+        x_patched = self.get_patched(x)
+        if self.objective == 'pred_noise':
+            pred_noise = self.get_patched(model_output)
+            x_start = self.predict_start_from_noise(x_patched, t_patchwise, pred_noise) 
+            x_start = maybe_clip(x_start)
+
+            if clip_x_start and rederive_pred_noise:
+                pred_noise = self.predict_noise_from_start(x_patched, t_patchwise, x_start)
+
+        elif self.objective == 'pred_x0':
+            x_start = self.get_patched(model_output)
+            x_start = maybe_clip(x_start)
+            pred_noise = self.predict_noise_from_start(x_patched, t_patchwise, x_start)
+
+        elif self.objective == 'pred_v':
+            v = self.get_patched(model_output)
+            x_start = self.predict_start_from_v(x_patched, t_patchwise, v)
+            x_start = maybe_clip(x_start)
+            pred_noise = self.predict_noise_from_start(x_patched, t_patchwise, x_start)
+
+        return ModelPrediction(pred_noise, x_start) # each shaped [b, num_p, patchsize]
+
+    def p_mean_variance(self, cond, x, t_patchwise, x_self_cond = None, clip_denoised = False):
+        preds = self.model_predictions(cond, x, t_patchwise, x_self_cond)
+        x_start = preds.pred_x_start # shaped [b, num_p, patchsize]
+        x_patched = self.get_patched(x)
+        if clip_denoised:
+            # x_start.clamp_(-6, 6)
+
+            if self.continuous:
+                sf = 2.0
+            else:
+                sf = 1.0
+
+            x_start.clamp_(-sf, sf)
+
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x_patched, t_patchwise = t_patchwise)
+        return model_mean, posterior_variance, posterior_log_variance, x_start
+
+    @torch.no_grad()
+    def p_sample(self, cond, x, t_patchwise, x_self_cond = None, clip_denoised = True, with_noise=False, scale=False):
+        b, *_, device = *x.shape, x.device
+        noise = torch.randn_like(x) if with_noise else 0
+
+        # if type(t) == int:
+        #     batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
+        #     noise = torch.randn_like(x) if t > 0 else 0.  # no noise if t == 0
+        # else:
+        #     batched_times = t
+        #     noise = torch.randn_like(x)
+
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(cond, x = x, t_patchwise=t_patchwise, x_self_cond = x_self_cond, clip_denoised = clip_denoised)
+
+        # if not scale:
+        #     model_mean = extract(self.sqrt_alphas_cumprod, t_patchwise.reshape(-1), x_start.reshape(-1, x_start.shape[-1]).shape)
+        #     model_mean = model_mean * x_start.reshape(-1, x_start.shape[-1])
+        #     model_mean = model_mean.view_as(x_start)  # [b, num_p, patchsize]
+
+        if with_noise:
+            pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
+        else:
+            pred_img = model_mean
+
+        return pred_img, x_start # both [b, num_patches, patchsize] shaped
+    
+    @torch.no_grad()
+    def p_sample_loop(self, batch_size, shape, inp, cond, mask, return_traj=False, patchwise_inference=True):
+        device = self.betas.device
+        num_patches = shape[-1] // self.patchsize
+        # print(f"num_patches is {num_patches} in p_sample_loop")
+
+        if hasattr(self.model, 'randn'):
+            img = self.model.randn(batch_size, shape, inp, device)
+        else:
+            img = torch.randn((batch_size, *shape), device=device)
+
+        x_start = None
+        preds = []
+
+        iterator = (
+            tqdm(reversed(range(0, self.num_timesteps)), desc='sampling', total=self.num_timesteps)
+            if self.show_inference_tqdm else reversed(range(0, self.num_timesteps))
+        )
+
+        for t in iterator:
+            t_patchwise = torch.full((batch_size, num_patches), t, device=device, dtype=torch.long)
+            # print(f"num_patches is {num_patches} in p_sample_loop t iterator")
+            self_cond = x_start if self.self_condition else None
+
+            if mask is not None:
+                cond_val = self.q_sample(x_start=inp, t_patchwise=t_patchwise, noise=torch.zeros_like(inp))
+                img = img * (1 - mask) + cond_val * mask
+
+            if patchwise_inference:
+                img_patched = self.get_patched(img)
+                x_start_patched = torch.zeros_like(img_patched)
+
+                for patch_idx in range(num_patches):
+                    # print(f"num_patches is {num_patches} in p_sample_loop patch index")
+                    patch_mask = torch.zeros((batch_size, num_patches), device=device)
+                    # print(f"num_patches is {num_patches} in p_sample_loop after pathc mask")
+                    patch_mask[:, patch_idx] = 1
+                    patch_mask = patch_mask.unsqueeze(-1).expand(-1, -1, self.patchsize).reshape(batch_size, -1)
+
+                    temp_img = img * patch_mask  # isolate only patch_idx
+                    patch_x_start_input = temp_img.clone()
+
+                    _, x_start_patch = self.p_sample(inp, patch_x_start_input, t_patchwise, self_cond, scale=False, with_noise=self.baseline)
+                    # x_start_patch = self.get_patched(x_start_patch)
+                    x_start_patched[:, patch_idx] = x_start_patch[:, patch_idx]
+
+                    if self.use_innerloop_opt and t < 50:
+                        step = 20 if self.sudoku else 5
+                        flat_img = x_start_patched.reshape(batch_size, -1)
+                        flat_img = self.opt_step(inp, flat_img, t_patchwise, mask, cond_val, step=step, sf=1.0, patch_idx=patch_idx)
+                        x_start_patched = self.get_patched(flat_img)
+
+                x_start = x_start_patched
+                img = x_start.view(batch_size, -1)
+            else:
+                img, x_start = self.p_sample(inp, img, t_patchwise, self_cond, scale=False, with_noise=self.baseline)
+                if mask is not None:
+                    img = img * (1 - mask) + cond_val * mask
+
+                if self.use_innerloop_opt and t < 50:
+                    step = 20 if self.sudoku else 5
+                    img = self.opt_step(inp, img, t_patchwise, mask, cond_val, step=step, sf=1.0)
+                    img = img.detach()
+
+            sf = 2.0 if self.continuous else 0.1 if self.shortest_path else 1.0
+            sqrt_alpha = extract(self.sqrt_alphas_cumprod, t_patchwise, x_start.shape)
+            max_val = sqrt_alpha * sf
+            max_val = max_val.expand(-1, -1, self.patchsize).reshape(batch_size, -1)
+            img = torch.clamp(img, -max_val.view_as(img), max_val.view_as(img))
+
+            img_unscaled = self.predict_start_from_noise(x_start, t_patchwise, torch.zeros_like(x_start))
+            preds.append(img_unscaled) # this is [b, num_p, ps]
+
+            if t != 0:
+                t_patchwise_prev = t_patchwise - 1
+                sqrt_alpha_prev = extract(self.sqrt_alphas_cumprod, t_patchwise_prev, img_unscaled.shape)
+
+                # sqrt_alpha_prev = extract(self.sqrt_alphas_cumprod, t_patchwise_prev.reshape(-1), img_unscaled.reshape(-1, img_unscaled.shape[-1]).shape)
+                while sqrt_alpha_prev.dim() < img_unscaled.dim():
+                    sqrt_alpha_prev = sqrt_alpha_prev.unsqueeze(-1)
+                img = (sqrt_alpha_prev * img_unscaled).view(batch_size, -1)
+            if img.dim() == 3:
+                img = img.view(img.size(0), -1)
+
+        return torch.stack(preds, dim=0) if return_traj else img
+
+
+    def opt_step(self, inp, img, t_patchwise, mask, data_cond, step=5, eval=True, sf=1.0, detach=True, patch_idx=None):
+        b, flat_dim = img.shape
+        num_patches = flat_dim // self.patchsize
+        # print(f"num_patches is {num_patches} in opt step")
+
+        with torch.enable_grad():
+            for i in range(step):
+                patch_mask = None
+                if patch_idx is not None:
+                    patch_mask = torch.zeros((b, num_patches), device=img.device)
+                    # print(f"num_patches is {num_patches} in opt step patch idx")
+                    patch_mask[:, patch_idx] = 1
+                    patch_mask = patch_mask.unsqueeze(-1).expand(-1, -1, self.patchsize).reshape(b, -1)
+
+                energy, grad = self.model(inp, img, t_patchwise, return_both=True)
+
+                if patch_mask is not None:
+                    grad = grad * patch_mask
+
+                grad_patched = self.get_patched(grad)              # (B, P, patchsize) but **not** contiguous
+                grad_flat    = grad_patched.reshape(-1, self.patchsize)
+                t_flat = t_patchwise.view(-1)
+                step_size = extract(self.opt_step_size, t_flat, (b * num_patches, 1)).view(b, num_patches, 1)
+                # print(f"num_patches is {num_patches} in opt step")
+                step_size = step_size.view(-1, 1)
+                grad_scaled = (grad_flat * step_size * sf).view(b, num_patches * self.patchsize)
+                # print(f"num_patches is {num_patches} in opt step")
+
+                img_new = img - grad_scaled
+
+                if mask is not None:
+                    img_new = img_new * (1 - mask) + mask * data_cond
+
+                sqrt_alpha = extract(self.sqrt_alphas_cumprod, t_flat, (b * num_patches, 1)).view(b, num_patches, 1)
+                # print(f"num_patches is {num_patches} in opt step")
+                max_val = sqrt_alpha * sf                                  # [b, num_patches, 1]
+                max_val = max_val.expand(-1, -1, self.patchsize)           # [b, num_patches, patchsize]
+                max_val = max_val.reshape(b, num_patches * self.patchsize) # [b, seq_len]
+                # print(f"num_patches is {num_patches} in opt step")
+
+                img_new = torch.clamp(img_new, -max_val, max_val)
+
+                energy_new = self.model(inp, img_new, t_patchwise, return_energy=True)
+                bad_step = (energy_new > energy).squeeze(-1)
+
+                img_patched = self.get_patched(img)
+                img_new_patched = self.get_patched(img_new)
+                bad_step_patched = bad_step.unsqueeze(-1).expand(-1, -1, self.patchsize)
+                img_new_patched = torch.where(bad_step_patched, img_patched, img_new_patched)
+                img_new = img_new_patched.view(b, -1)
+
+                img = img_new.detach() if eval else img_new
+
+        return img
+
+
+    @torch.no_grad()
+    def ddim_sample(self, shape, clip_denoised = True):
+        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+
+        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+
+        img = torch.randn(shape, device = device)
+
+        x_start = None
+
+        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
+            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
+            self_cond = x_start if self.self_condition else None
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = clip_denoised)
+
+            if time_next < 0:
+                img = x_start
+                continue
+
+            alpha = self.alphas_cumprod[time]
+            alpha_next = self.alphas_cumprod[time_next]
+
+            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+            c = (1 - alpha_next - sigma ** 2).sqrt()
+
+            noise = torch.randn_like(img)
+
+            img = x_start * alpha_next.sqrt() + \
+                  c * pred_noise + \
+                  sigma * noise
+
+        return img
+
+    @torch.no_grad()
+    def sample(self, x, label, mask, batch_size = 16, return_traj=False):
+        # seq_length, channels = self.seq_length, self.channels
+        sample_fn = self.p_sample_loop # if not self.is_ddim_sampling else self.ddim_sample
+        return sample_fn(batch_size, self.out_shape, x, label, mask, return_traj=return_traj, patchwise_inference = self.patchwise_inference)
+
+    @torch.no_grad()
+    def interpolate(self, x1, x2, t = None, lam = 0.5):
+        b, *_, device = *x1.shape, x1.device
+        t = default(t, self.num_timesteps - 1)
+
+        assert x1.shape == x2.shape
+
+        num_patches = x1.shape[1] // self.patchsize
+        t_patchwise = torch.full((b, num_patches), t, device=device)
+        xt1, xt2 = map(lambda x: self.q_sample(x, t=t_patchwise), (x1, x2))
+
+        # t_batched = torch.full((b,), t, device = device)
+        # xt1, xt2 = map(lambda x: self.q_sample(x, t = t_batched), (x1, x2))
+
+        img = (1 - lam) * xt1 + lam * xt2
+
+        x_start = None
+
+        for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t):
+            t_patchwise_i = torch.full((b, num_p), i, device=device)
+            img, x_start = self.p_sample(None, img, t_patchwise_i, self_cond)
+
+            # self_cond = x_start if self.self_condition else None
+            # img, x_start = self.p_sample(img, i, self_cond)
+
+        return img
+
+    # def q_sample(self, x_start, t_patchwise, noise=None):
+    #     noise = default(noise, lambda: torch.randn_like(x_start))
+
+    #     return (
+    #         extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+    #         extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+    #     )
+    def q_sample(self, x_start, t_patchwise, noise=None):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        B, seq_len = x_start.shape
+        num_patches = seq_len // self.patchsize
+        x_start_patched = x_start.view(B, num_patches, self.patchsize)
+        noise_patched   = noise.view(B, num_patches, self.patchsize)
+
+        t_flat = t_patchwise.reshape(-1)                # length B*num_patches
+        sqrt_alpha     = extract(self.sqrt_alphas_cumprod, t_flat, (B * num_patches, 1))\
+                        .view(B, num_patches, 1)     # (B, num_patches, 1)
+        sqrt_one_minus = extract(self.sqrt_one_minus_alphas_cumprod, t_flat, (B * num_patches, 1))\
+                        .view(B, num_patches, 1)     # (B, num_patches, 1)
+        # print(f"num_patches is {num_patches} in q sample")
+        out = sqrt_alpha * x_start_patched + sqrt_one_minus * noise_patched
+        return out.view(B, seq_len)
+
+
+    def p_losses(self, inp, x_start, mask, t_patchwise, noise = None):
+        b, *c = x_start.shape
+        noise = default(noise, lambda: torch.randn_like(x_start))
+
+        # noise sample
+        x = self.q_sample(x_start = x_start, t_patchwise = t_patchwise, noise = noise)
+
+        if mask is not None:
+            # Mask out inputs
+            x_cond = self.q_sample(x_start = inp, t_patchwise = t_patchwise, noise = torch.zeros_like(noise))
+            x = x * (1 - mask) + mask * x_cond
+
+        # predict and take gradient step
+        model_out = self.model(inp, x, t_patchwise)
+
+        if self.objective == 'pred_noise':
+            target = noise
+        elif self.objective == 'pred_x0':
+            target = x_start
+        elif self.objective == 'pred_v':
+            v = self.predict_v(x_start, t_patchwise, noise)
+            target = v
+        else:
+            raise ValueError(f'unknown objective {self.objective}')
+
+        if mask is not None:
+            # Mask out targets
+            model_out = model_out * (1 - mask) + mask * target
+
+        loss = F.mse_loss(model_out, target, reduction = 'none')
+
+        if self.shortest_path:
+            mask1 = (x_start > 0)
+            mask2 = torch.logical_not(mask1)
+            # mask1, mask2 = mask1.float(), mask2.float()
+            weight = mask1 * 10 + mask2 * 0.5
+            # loss = (loss * weight) / weight.sum() * target.numel()
+            loss = loss * weight
+
+        loss = reduce(loss, 'b ... -> b (...)', 'mean')
+        
+        # Extract loss_weight using the flattened t_patchwise
+        t_flat = t_patchwise.reshape(-1)
+        loss_weight = extract(self.loss_weight, t_flat, (b * t_patchwise.shape[1], 1)).view(b, -1).mean(dim=1, keepdim=True)   # (B, 1)
+        loss = loss * loss_weight
+        loss_mse = loss
+
+        if self.supervise_energy_landscape:
+            noise = torch.randn_like(x_start)
+            data_sample = self.q_sample(x_start = x_start, t_patchwise = t_patchwise, noise = noise)
+
+            if mask is not None:
+                data_cond = self.q_sample(x_start = x_start, t_patchwise = t_patchwise, noise = torch.zeros_like(noise))
+                data_sample = data_sample * (1 - mask) + mask * data_cond
+
+            # Add a noise contrastive estimation term with samples drawn from the data distribution
+            # Optimize a sample using gradient descent on energy landscape
+            xmin_noise = self.q_sample(x_start = x_start, t_patchwise = t_patchwise, noise = 3.0 * noise)
+
+            if mask is not None:
+                xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
+            else:
+                data_cond = None
+
+            if self.sudoku:
+                s = x_start.size()
+                x_start_im = x_start.view(-1, 9, 9, 9).argmax(dim=-1)
+                randperm = torch.randint(0, 9, x_start_im.size(), device=x_start_im.device)
+
+                rand_mask = (torch.rand(x_start_im.size(), device=x_start_im.device) < 0.05).float()
+
+                xmin_noise_im = x_start_im * (1 - rand_mask) + randperm * (rand_mask)
+
+                xmin_noise_im = F.one_hot(xmin_noise_im.long(), num_classes=9)
+                xmin_noise_im = (xmin_noise_im - 0.5) * 2
+
+                xmin_noise_rescale = xmin_noise_im.view(-1, 729)
+
+                loss_opt = torch.ones(1)
+
+                loss_scale = 0.05
+            elif self.connectivity:
+                s = x_start.size()
+                x_start_im = x_start.view(-1, 12, 12)
+                randperm = (torch.randint(0, 1, x_start_im.size(), device=x_start_im.device) - 0.5) * 2
+
+                rand_mask = (torch.rand(x_start_im.size(), device=x_start_im.device) < 0.05).float()
+
+                xmin_noise_rescale = x_start_im * (1 - rand_mask) + randperm * (rand_mask)
+
+                loss_opt = torch.ones(1)
+
+                loss_scale = 0.05
+            elif self.shortest_path:
+                x_start_list = x_start.argmax(dim=2)
+                classes = x_start.size(2)
+                rand_vals = torch.randint(0, classes, x_start_list.size()).to(x_start.device)
+
+                x_start_neg = torch.cat([rand_vals[:, :1], x_start_list[:, 1:]], dim=1)
+                x_start_neg_oh = F.one_hot(x_start_neg[:, :, 0].long(), num_classes=classes)[:, :, :, None]
+                xmin_noise_rescale = (x_start_neg_oh - 0.5) * 2
+
+                loss_opt = torch.ones(1)
+
+                loss_scale = 0.5
+            else:
+                xmin_noise = self.opt_step(inp, xmin_noise, t_patchwise, mask, data_cond, step=2, sf=1.0)
+                
+                # Need to use patch-wise extraction for sqrt_alphas_cumprod
+                x_patched = self.get_patched(x_start)
+                t_flat = t_patchwise.reshape(-1)
+                x_shape = x_patched.shape
+                x_flat = x_patched.reshape(-1, x_shape[-1])
+                sqrt_alpha = extract(self.sqrt_alphas_cumprod, t_flat, (len(t_flat), 1))
+                xmin = (sqrt_alpha * x_flat).reshape(*x_shape).view(b, -1)
+                
+                loss_opt = torch.pow(xmin_noise - xmin, 2).mean()
+
+                xmin_noise = xmin_noise.detach()
+                xmin_noise_patched = self.get_patched(xmin_noise)
+                xmin_noise_rescale = self.predict_start_from_noise(xmin_noise_patched, t_patchwise, torch.zeros_like(xmin_noise_patched))
+                xmin_noise_rescale = torch.clamp(xmin_noise_rescale, -2, 2).view(b, -1)
+
+                loss_scale = 0.5
+
+            xmin_noise = self.q_sample(x_start=xmin_noise_rescale, t_patchwise=t_patchwise, noise=noise)
+
+            if mask is not None:
+                xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
+
+            # Compute energy of both distributions
+            inp_concat = torch.cat([inp, inp], dim=0)
+            x_concat = torch.cat([data_sample, xmin_noise], dim=0)
+            t_concat = torch.cat([t_patchwise, t_patchwise], dim=0)
+            energy = self.model(inp_concat, x_concat, t_concat, return_energy=True)
+
+            # Compute noise contrastive energy loss
+            energy_real, energy_fake = torch.chunk(energy, 2, 0)
+            energy_real = energy_real.squeeze(-1)    # [B, 1]
+            energy_fake = energy_fake.squeeze(-1)    # [B, 1]
+            energy_stack = torch.stack([energy_real, energy_fake], dim=1) # (B, 2, P)\nB, C, P = energy_stack.shape\n
+            B, _, P = energy_stack.shape
+            target = torch.zeros(B, P, dtype=torch.long, device=energy_stack.device)  # [B, P]
+
+            # loss ---------------------------------------------------------------
+            loss_energy = F.cross_entropy(
+                -energy_stack,              # logits
+                target,                     # class indices
+                reduction='none'            # → [B, P]
+            ).mean(dim=1, keepdim=True)     # → [B, 1]  (keep the singleton if you need it)
+            # target = torch.zeros(energy_real.size(0)).to(energy_stack.device)
+            # loss_energy = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')[:, None]
+
+            loss = loss_mse + loss_scale * loss_energy # + 0.001 * loss_opt
+            return loss.mean(), (loss_mse.mean(), loss_energy.mean(), loss_opt.mean())
+        else:
+            loss = loss_mse
+            return loss.mean(), (loss_mse.mean(), -1, -1)
+
+    def forward(self, inp, target, mask, *args, **kwargs):
+        b, *c = target.shape
+        device = target.device
+        # if len(c) == 1:
+        #     self.out_dim = c[0]
+        #     self.out_shape = c
+        # else:
+        #     self.out_dim = c[-1]
+        #     self.out_shape = c
+        num_patches = target.shape[-1] // self.patchsize
+        t_patchwise = torch.randint(0, self.num_timesteps, (b, num_patches), device=device).long()
+        # t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        # print(f"num_patches is {num_patches} in p losses")
+        return self.p_losses(inp, target, mask, t_patchwise, *args, **kwargs)
+
+# patch trainer class
+
+class PatchTrainer1D(object):
+    def __init__(
+        self,
+        diffusion_model: PatchGaussianDiffusion1D,
+        dataset: Dataset,
+        *,
+        train_batch_size = 16,
+        validation_batch_size = None,
+        gradient_accumulate_every = 1,
+        train_lr = 1e-4,
+        train_num_steps = 100000,
+        ema_update_every = 10,
+        ema_decay = 0.995,
+        adam_betas = (0.9, 0.99),
+        save_and_sample_every = 1000,
+        num_samples = 25,
+        data_workers = None,
+        results_folder = './patchresults',
+        amp = False,
+        fp16 = False,
+        split_batches = True,
+        metric = 'mse',
+        cond_mask = False,
+        validation_dataset = None,
+        extra_validation_datasets = None,
+        extra_validation_every_mul = 10,
+        evaluate_first = False,
+        latent = False,
+        autoencode_model = None,
+        patchwise_inference = True
+    ):
+        super().__init__()
+
+        # accelerator
+
+        self.accelerator = Accelerator(
+            split_batches = split_batches,
+            mixed_precision = 'fp16' if fp16 else 'no'
+        )
+
+        self.accelerator.native_amp = amp
+
+        # model
+
+        self.model = diffusion_model
+
+        # Conditioning on mask
+
+        self.cond_mask = cond_mask
+
+        # Whether to do reasoning in the latent space
+
+        self.latent = latent
+
+        if autoencode_model is not None:
+            self.autoencode_model = autoencode_model.cuda()
+
+        # sampling and training hyperparameters
+        self.out_dim = self.model.out_dim
+
+        assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
+        self.num_samples = num_samples
+        self.save_and_sample_every = save_and_sample_every
+        self.extra_validation_every_mul = extra_validation_every_mul
+
+        self.batch_size = train_batch_size
+        self.validation_batch_size = validation_batch_size if validation_batch_size is not None else train_batch_size
+        self.gradient_accumulate_every = gradient_accumulate_every
+
+        self.train_num_steps = train_num_steps
+
+        # Evaluation metric.
+        self.metric = metric
+        self.data_workers = data_workers
+
+        if self.data_workers is None:
+            self.data_workers = cpu_count()
+
+        # dataset and dataloader
+
+        dl = DataLoader(dataset, batch_size = train_batch_size, shuffle = True, pin_memory = False, num_workers = self.data_workers)
+
+        dl = self.accelerator.prepare(dl)
+        self.dl = cycle(dl)
+
+        self.validation_dataset = validation_dataset
+
+        if self.validation_dataset is not None:
+            dl = DataLoader(self.validation_dataset, batch_size = validation_batch_size, shuffle=False, pin_memory=False, num_workers = self.data_workers)
+            dl = self.accelerator.prepare(dl)
+            self.validation_dl = dl
+        else:
+            self.validation_dl = None
+
+        self.extra_validation_datasets = extra_validation_datasets
+
+        if self.extra_validation_datasets is not None:
+            self.extra_validation_dls = dict()
+            for key, dataset in self.extra_validation_datasets.items():
+                dl = DataLoader(dataset, batch_size = validation_batch_size, shuffle=False, pin_memory=False, num_workers = self.data_workers)
+                dl = self.accelerator.prepare(dl)
+                self.extra_validation_dls[key] = dl
+        else:
+            self.extra_validation_dls = None
+
+        # optimizer
+
+        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
+
+        # for logging results in a folder periodically
+
+        if self.accelerator.is_main_process:
+            self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
+            self.ema.ema_model.patchwise_inference = patchwise_inference
+            self.ema.to(self.device)
+
+        self.results_folder = Path(results_folder)
+        self.results_folder.mkdir(exist_ok = True)
+
+        # step counter state
+
+        self.step = 0
+
+        # prepare model, dataloader, optimizer with accelerator
+
+        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+        self.evaluate_first = evaluate_first
+        self.model.patchwise_inference = patchwise_inference
+
+        self.val_accuracy_log = self.results_folder / "validation_accuracy.csv"
+        self.patch_accuracy_log = self.results_folder / "patch_accuracy.csv"
+        for file in [self.val_accuracy_log, self.patch_accuracy_log]:
+            if not os.path.exists(file):
+                with open(file, mode='w', newline='') as f:
+                    writer = csv.writer(f)
+                    if "val_accuracy" in str(file):
+                        writer.writerow(["step", "accuracy"])
+                    elif "patch_accuracy" in str(file):
+                        writer.writerow(["step", "patch_idx", "accuracy"])
+    def _log_csv(self, filepath, row, header=None):
+        write_header = not filepath.exists()
+        with open(filepath, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if write_header and header is not None:
+                writer.writerow(header)
+            writer.writerow(row)
+
+    @property
+    def device(self):
+        return self.accelerator.device
+
+    def save(self, milestone):
+        if not self.accelerator.is_local_main_process:
+            return
+
+        data = {
+            'step': self.step,
+            'model': self.accelerator.get_state_dict(self.model),
+            'opt': self.opt.state_dict(),
+            'ema': self.ema.state_dict(),
+            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
+        }
+
+        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+
+    def load(self, milestone):
+        if osp.isfile(milestone):
+            milestone_file = milestone
+        else:
+            milestone_file = str(self.results_folder / f'model-{milestone}.pt')
+        data = torch.load(milestone_file)
+
+        model = self.accelerator.unwrap_model(self.model)
+        model.load_state_dict(data['model'])
+
+        self.step = data['step']
+        self.opt.load_state_dict(data['opt'])
+        if self.accelerator.is_main_process:
+            self.ema.load_state_dict(data["ema"])
+
+        if 'version' in data:
+            print(f"loading from version {data['version']}")
+
+        if exists(self.accelerator.scaler) and exists(data['scaler']):
+            self.accelerator.scaler.load_state_dict(data['scaler'])
+
+    def train(self):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        if self.evaluate_first:
+            milestone = self.step // self.save_and_sample_every
+            self.evaluate(device, milestone)
+            self.evaluate_first = False  # hack: later we will use this flag as a bypass signal to determine whether we want to run extra validation.
+
+        end_time = time.time()
+        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process, dynamic_ncols = True) as pbar:
+
+            while self.step < self.train_num_steps:
+
+                total_loss = 0.
+
+                end_time = time.time()
+                for _ in range(self.gradient_accumulate_every):
+                    data = next(self.dl)
+
+                    if self.cond_mask:
+                        inp, label, mask = data
+                        inp, label, mask = inp.float().to(device), label.float().to(device), mask.float().to(device)
+                    elif self.latent:
+                        inp, label, label_gt, mask_latent = data
+                        mask_latent = mask_latent.float().to(device)
+                        inp, label, label_gt = inp.float().to(device), label.float().to(device), label_gt.float().to(device)
+                        mask = None
+                    else:
+                        inp, label = data
+                        inp, label = inp.float().to(device), label.float().to(device)
+                        mask = None
+
+                    data_time = time.time() - end_time; end_time = time.time()
+
+                    with self.accelerator.autocast():
+                        loss, (loss_denoise, loss_energy, loss_opt) = self.model(inp, label, mask)
+                        loss = loss / self.gradient_accumulate_every
+                        total_loss += loss.item()
+
+                    self.accelerator.backward(loss)
+
+                accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+
+                accelerator.wait_for_everyone()
+
+                self.opt.step()
+                self.opt.zero_grad()
+
+                accelerator.wait_for_everyone()
+
+                nn_time = time.time() - end_time; end_time = time.time()
+                pbar.set_description(f'loss: {total_loss:.4f} loss_denoise: {loss_denoise:.4f} loss_energy: {loss_energy:.4f} loss_opt: {loss_opt:.4f} data_time: {data_time:.2f} nn_time: {nn_time:.2f}')
+
+                self.step += 1
+                if accelerator.is_main_process:
+                    self.ema.update()
+
+                    # if True:
+                    if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                        milestone = self.step // self.save_and_sample_every
+
+                        self.save(milestone)
+
+                        if self.latent:
+                            self.evaluate(device, milestone, inp=inp, label=label_gt, mask=mask_latent)
+                        else:
+                            self.evaluate(device, milestone, inp=inp, label=label, mask=mask)
+
+
+                pbar.update(1)
+
+        accelerator.print('training complete')
+
+    def evaluate(self, device, milestone, inp=None, label=None, mask=None):
+        print('Running Evaluation...')
+        self.ema.ema_model.eval()
+
+        if inp is not None and label is not None:
+            with torch.no_grad():
+                # batches = num_to_groups(self.num_samples, self.batch_size)
+
+                if self.latent:
+                    all_samples_list = list(map(lambda n: self.ema.ema_model.sample(inp, label, None, batch_size=inp.size(0)), range(1)))
+                else:
+                    all_samples_list = list(map(lambda n: self.ema.ema_model.sample(inp, label, mask, batch_size=inp.size(0)), range(1)))
+                    # all_samples_list = list(map(lambda n: self.ema.ema_model.sample(inp, label, mask, batch_size=inp.size(0), return_traj=True), range(1)))
+                # all_samples_list = list(map(lambda n: self.model.sample(inp, label, mask, batch_size=inp.size(0)), range(1)))
+                # all_samples_list = [self.model.sample(inp, batch_size=inp.size(0))]
+
+                all_samples = torch.cat(all_samples_list, dim = 0)
+
+                print(f'Validation Result @ Iteration {self.step}; Milestone = {milestone} (Train)')
+                if self.metric == 'mse':
+                    all_samples = torch.cat(all_samples_list, dim = 0)
+                    mse_error = (all_samples - label).pow(2).mean()
+                    rows = [('mse_error', mse_error)]
+                    print(tabulate(rows))
+                elif self.metric == 'bce':
+                    assert len(all_samples_list) == 1
+                    summary = binary_classification_accuracy_4(all_samples_list[0], label)
+                    rows = [[k, v] for k, v in summary.items()]
+                    print(tabulate(rows))
+                elif self.metric == 'sudoku':
+                    assert len(all_samples_list) == 1
+                    summary = sudoku_accuracy(all_samples_list[0], label, mask)
+                    rows = [[k, v] for k, v in summary.items()]
+                    print(tabulate(rows))
+                elif self.metric == 'sort':
+                    assert len(all_samples_list) == 1
+                    summary = binary_classification_accuracy_4(all_samples_list[0], label)
+                    summary.update(sort_accuracy(all_samples_list[0], label, mask))
+                    rows = [[k, v] for k, v in summary.items()]
+                elif self.metric == 'sort-2':
+                    assert len(all_samples_list) == 1
+                    summary = sort_accuracy_2(all_samples_list[0], label, mask)
+                    rows = [[k, v] for k, v in summary.items()]
+                elif self.metric == 'shortest-path-1d':
+                    assert len(all_samples_list) == 1
+                    summary = binary_classification_accuracy_4(all_samples_list[0], label)
+                    summary.update(shortest_path_1d_accuracy(all_samples_list[0], label, mask, inp))
+                    rows = [[k, v] for k, v in summary.items()]
+                elif self.metric == 'sudoku_latent':
+                    sample = all_samples_list[0].view(-1, 9, 9, 3).permute(0, 3, 1, 2).contiguous() * 4
+                    prediction = self.autoencode_model.decode(sample)
+                    prediction = prediction.permute(0, 2, 3, 1).contiguous().view(-1, 729)
+
+                    assert len(all_samples_list) == 1
+                    summary = sudoku_accuracy(prediction, label, mask)
+                    rows = [[k, v] for k, v in summary.items()]
+                    print(tabulate(rows))
+                else:
+                    raise NotImplementedError()
+
+        if self.validation_dl is not None:
+            self._run_validation(self.validation_dl, device, milestone, prefix = 'Validation')
+
+        if (self.step % (self.save_and_sample_every * self.extra_validation_every_mul) == 0 and self.extra_validation_dls is not None) or self.evaluate_first:
+            for key, extra_dl in self.extra_validation_dls.items():
+                self._run_validation(extra_dl, device, milestone, prefix = key)
+
+    def _run_validation(self, dl, device, milestone, prefix='Validation'):
+        meters = collections.defaultdict(AverageMeter)
+        with torch.no_grad():
+            for i, data in enumerate(tqdm(dl, total=len(dl), desc=f'running on the validation dataset (ID: {prefix})')):
+                if self.cond_mask:
+                    inp, label, mask = map(lambda x: x.float().to(device), data)
+                elif self.latent:
+                    inp, label, label_gt, mask = map(lambda x: x.float().to(device), data)
+                else:
+                    inp, label = map(lambda x: x.float().to(device), data)
+                    mask = None
+
+                if self.latent:
+                    # Masking doesn't make sense in the latent space
+                    # samples = self.ema.ema_model.sample(inp, label, None, batch_size=inp.size(0))
+                    samples = self.ema.ema_model.sample(inp, label, None, batch_size=inp.size(0))
+                else:
+                    # samples = self.ema.ema_model.sample(inp, label, mask, batch_size=inp.size(0))
+                    # samples = self.ema.ema_model.sample(inp, label, mask, batch_size=inp.size(0))
+                    samples = self.ema.ema_model.sample(inp, label, mask, batch_size=inp.size(0))
+                # if samples.dim() == 3:
+                #     samples = samples.view(samples.size(0), -1)  # [batch, num_patches * patch_dim]
+
+                assert samples.shape == label.shape, "sample/label size mismatch"
+                # np.savez("sudoku.npz", inp=inp.detach().cpu().numpy(), label=label.detach().cpu().numpy(), mask=mask.detach().cpu().numpy(), samples=samples.detach().cpu().numpy())
+                # import pdb
+                # pdb.set_trace()
+                # print("here")
+                if self.metric == 'sudoku':
+                    # samples_traj = samples
+                    summary = sudoku_accuracy(samples[-1], label, mask)
+                    for k, v in summary.items():
+                        meters[k].update(v, n=inp.size(0))
+                elif self.metric == 'sudoku_latent':
+                    sample = samples.view(-1, 9, 9, 3).permute(0, 3, 1, 2).contiguous() * 4
+                    prediction = self.autoencode_model.decode(sample)
+                    prediction = prediction.permute(0, 2, 3, 1).contiguous().view(-1, 729)
+                    summary = sudoku_accuracy(prediction, label_gt, mask)
+                    for k, v in summary.items():
+                        meters[k].update(v, n=inp.size(0))
+                elif self.metric == 'sort':
+                    summary = binary_classification_accuracy_4(samples, label)
+                    summary.update(sort_accuracy(samples, label, mask))
+                    for k, v in summary.items():
+                        meters[k].update(v, n=inp.size(0))
+                    if i > 20:
+                        break
+                elif self.metric == 'sort-2':
+                    summary = sort_accuracy_2(samples, label, mask)
+                    for k, v in summary.items():
+                        meters[k].update(v, n=inp.size(0))
+                    if i > 20:
+                        break
+                elif self.metric == 'shortest-path-1d':
+                    summary = binary_classification_accuracy_4(samples, label)
+                    summary.update(shortest_path_1d_accuracy(samples, label, mask, inp))
+                    # summary.update(shortest_path_1d_accuracy_closed_loop(samples, label, mask, inp, self.ema.ema_model.sample))
+                    for k, v in summary.items():
+                        meters[k].update(v, n=inp.size(0))
+                    if i > 20:
+                        break
+                elif self.metric == 'mse':
+                    # all_samples = torch.cat(all_samples_list, dim = 0)
+                    mse_error = (samples - label).pow(2).mean()
+                    meters['mse'].update(mse_error, n=inp.size(0))
+                    if i > 20:
+                        break
+                    B, D = samples.shape
+                    P = D // self.model.patchsize
+                    samples_patched = samples.view(B, P, self.model.patchsize)
+                    label_patched = label.view(B, P, self.model.patchsize)
+
+                    patch_mse = (samples_patched - label_patched).pow(2).mean(dim=-1)  # → [B, P]
+
+                    # Log the patch-wise loss
+                    for b in range(B):
+                        for p in range(P):
+                            self._log_csv(
+                                self.patch_accuracy_log,
+                                [self.step, p, patch_mse[b, p].item()],
+                                header=["step", "patch_idx", "loss"]
+                            )
+
+                    # Optionally update a global MSE meter
+                    mse_error = patch_mse.mean()  # overall average
+                    meters['mse'].update(mse_error, n=B)
+
+                elif self.metric == 'bce':
+                    summary = binary_classification_accuracy_4(samples, label)
+                    for k, v in summary.items():
+                        meters[k].update(v, n=samples.shape[0])
+                    if i > 20:
+                        break
+                else:
+                    raise NotImplementedError()
+
+            rows = [[k, v.avg] for k, v in meters.items()]
+            for k, v in meters.items():
+                self._log_csv(
+                    self.val_accuracy_log,
+                    [self.step, prefix, k, v.avg],
+                    header=["step", "dataset", "metric", "value"]
+                )
             print(f'Validation Result @ Iteration {self.step}; Milestone = {milestone} (ID: {prefix})')
             print(tabulate(rows))
 
