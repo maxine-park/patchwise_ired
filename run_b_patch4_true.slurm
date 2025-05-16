@@ -9,7 +9,7 @@
 #SBATCH --time=12:00:00
 
 source ~/.bashrc
-mamba activate myenv
+source ~/patchwise_ired/myenv/bin/activate
 
 mkdir -p logs cluster_logs
 
