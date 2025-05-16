@@ -43,7 +43,7 @@ parser.add_argument('--inspect-dataset', action='store_true', help='run an IPyth
 parser.add_argument('--model', default='mlp', type=str, choices=['mlp', 'mlp-reverse', 'sudoku', 'sudoku-latent', 'sudoku-transformer', 'sudoku-reverse', 'gnn', 'gnn-reverse', 'gnn-conv', 'gnn-conv-1d', 'gnn-conv-1d-v2', 'gnn-conv-1d-v2-reverse'])
 parser.add_argument('--load-milestone', type=str, default=None, help='load a model from a milestone')
 parser.add_argument('--batch_size', default=2048, type=int, help='size of batch of input to use')
-parser.add_argument('--diffusion_steps', default=10, type=int, help='number of diffusion time steps (default: 10)')
+parser.add_argument('--diffusion_steps', default=20, type=int, help='number of diffusion time steps (default: 10)')
 parser.add_argument('--rank', default=20, type=int, help='rank of matrix to use')
 parser.add_argument('--data-workers', type=int, default=None, help='number of workers to use for data loading')
 parser.add_argument('--supervise-energy-landscape', type=str2bool, default=False)

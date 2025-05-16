@@ -1932,8 +1932,8 @@ class PatchTrainer1D(object):
         self.evaluate_first = evaluate_first
         self.model.patchwise_inference = patchwise_inference
 
-        self.val_accuracy_log = self.results_folder / "validation_accuracy.csv"
-        self.patch_accuracy_log = self.results_folder / "patch_accuracy.csv"
+        self.val_accuracy_log = self.results_folder / f"validation_accuracy_ps{self.patchsize}.csv"
+        self.patch_accuracy_log = self.results_folder / f"patch_accuracy_ps{self.patchsize}.csv"
         for file in [self.val_accuracy_log, self.patch_accuracy_log]:
             if not os.path.exists(file):
                 with open(file, mode='w', newline='') as f:
